@@ -1,6 +1,14 @@
-import { CSSProperties, Dispatch, SetStateAction, useEffect, useRef, useState } from 'react'
+import {
+  CSSProperties,
+  Dispatch,
+  SetStateAction,
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+} from 'react'
 import { Check, ChevronsUpDown } from 'lucide-react'
-import { get } from '~/lib/fetchWrappers'
+import { get } from '~/lib//fetch/fetchWrappers'
 import { paths } from '~/types/api'
 import {
   Button_Shadcn_ as Button,
@@ -22,17 +30,42 @@ import { proxy, useSnapshot } from 'valtio'
 import { LOCAL_STORAGE_KEYS, remove, retrieve, store } from '~/lib/storage'
 import Link from 'next/link'
 import { useIsLoggedIn, useIsUserLoading } from 'common'
+import { ProjectsData, invalidateProjectsQuery, useProjectsQuery } from '~/lib/fetch/projects'
+import {
+  OrganizationsData,
+  invalidateOrganizationsQuery,
+  useOrganizationsQuery,
+} from '~/lib/fetch/organizations'
+import { BranchesData, useAllProjectsBranchesQuery } from '~/lib/fetch/branches'
+import { invalidateProjectApiQuery, useProjectApiQuery } from '~/lib/fetch/projectApi'
+import { useRootQueryClient } from '~/lib/fetch/queryClient'
+import { useQueryClient } from '@tanstack/react-query'
+import { useOnLogout } from '~/lib/userAuth'
+import { Project } from 'next/dist/build/swc'
+
+interface InstanceData {
+  organization: OrganizationsData[number] | null
+  project: ProjectsData[number]
+  branch?: BranchesData[number]
+}
 
 const projectStore = proxy({
   dataRequested: false,
   setDataRequested: (newValue: boolean) => {
     projectStore.dataRequested = newValue
   },
-  selectedId: null,
-  setSelectedId: (id: string | null) => {
-    projectStore.selectedId = id
-    if (id !== null) {
-      store('local', LOCAL_STORAGE_KEYS.SAVED_ORG_PROJECT_BRANCH, id)
+  selectedInstance: null as InstanceData | null,
+  setSelectedInstance: (instance: InstanceData | null) => {
+    projectStore.selectedInstance = instance
+    if (instance !== null) {
+      store(
+        'local',
+        LOCAL_STORAGE_KEYS.SAVED_ORG_PROJECT_BRANCH,
+        JSON.stringify(
+          // @ts-ignore -- problem with OpenAPI spec that codegen reads from
+          [instance.organization?.id, instance.project.ref, instance.branch?.id ?? null]
+        )
+      )
     }
   },
   projectKeys: [] as ProjectKey[],
@@ -40,7 +73,7 @@ const projectStore = proxy({
     projectStore.projectKeys = projects
   },
   clear: () => {
-    projectStore.setSelectedId(null)
+    projectStore.setSelectedInstance(null)
     projectStore.setProjectKeys([])
     // Also done centrally in lib/userAuth,
     // but no harm and an extra failsafe in doing it twice
@@ -281,38 +314,79 @@ function ComboBox({
   )
 }
 
-export function ProjectConfigVariables({ variable }: { variable: Variable }) {
-  const isLoggedIn = useIsLoggedIn()
-  const { selectedId, setSelectedId } = useSnapshot(projectStore)
-  const { projectKeys, isLoading, isError } = useListAllProjectKeys()
+type ProjectConfigVariablesState =
+  | 'userLoading'
+  | 'loggedOut'
+  | 'loggedIn.dataPending'
+  | 'loggedIn.hasData'
+  | 'loggedIn.hasNoData'
+  | 'loggedIn.dataError'
+
+type ProjectConfigVariablesPlusApiState =
+  | Omit<ProjectConfigVariablesState, 'loggedIn.hasData'>
+  | 'loggedIn.hasData.apiDataPending'
+  | 'loggedIn.hasData.hasApiData'
+  | 'loggedIn.hasData.hasNoApiData'
+
+function useCopy() {
   const [copied, setCopied] = useState(false)
 
-  const handleCopy = () => {
+  function handleCopy() {
     setCopied(true)
     setTimeout(() => {
       setCopied(false)
     }, 1000)
   }
 
-  useEffect(() => {
-    if (!selectedId && typeof window !== undefined) {
-      const storedId = retrieve('local', LOCAL_STORAGE_KEYS.SAVED_ORG_PROJECT_BRANCH)
-      setSelectedId(storedId ?? projectKeys?.[0]?.id ?? null)
-    }
-  }, [selectedId, projectKeys, setSelectedId])
+  return { copied, handleCopy }
+}
 
-  const currentProject = (projectKeys ?? []).find(
-    // Lowercasing is necessary as Command will lowercase values under the hood
-    (project) => project.id.toLowerCase() === selectedId?.toLowerCase()
+function ProjectConfigVariablesView({
+  parentStateSummary,
+  variable,
+}: {
+  parentStateSummary: ProjectConfigVariablesState
+  variable: Variable
+}) {
+  const { selectedInstance } = useSnapshot(projectStore)
+
+  const projectRef = selectedInstance?.branch
+    ? selectedInstance?.branch?.project_ref
+    : // @ts-ignore -- problem with OpenAPI spec that codegen reads from
+      selectedInstance?.project.ref
+  const {
+    data: apiData,
+    isPending: apiIsPending,
+    isSuccess: apiIsSuccess,
+  } = useProjectApiQuery(
+    {
+      projectRef,
+    },
+    { enabled: !!projectRef }
   )
-  const currentSelection =
-    variable === 'url'
-      ? currentProject?.endpoint
-      : variable === 'anonKey'
-      ? currentProject?.keys.anonKey
-      : 'Wrong variable'
 
-  const noData = !isLoading && projectKeys.length === 0
+  const { copied, handleCopy } = useCopy()
+
+  const apiStateSummary: ProjectConfigVariablesPlusApiState =
+    parentStateSummary !== 'loggedIn.hasData'
+      ? parentStateSummary
+      : apiIsPending
+      ? 'loggedIn.hasData.apiDataPending'
+      : apiIsSuccess
+      ? 'loggedIn.hasData.hasApiData'
+      : 'loggedIn.hasData.hasNoApiData'
+
+  let variableValue: string = null
+  if (apiIsSuccess) {
+    switch (variable) {
+      case 'url':
+        variableValue = apiData.autoApiService.endpoint
+        break
+      case 'anonKey':
+        variableValue = apiData.autoApiService.defaultApiKey
+        break
+    }
+  }
 
   return (
     <div
@@ -321,17 +395,12 @@ export function ProjectConfigVariables({ variable }: { variable: Variable }) {
     >
       <div className="flex flex-wrap items-center justify-between gap-2">
         <span>{prettyFormatVariable[variable]}</span>
-        {isLoggedIn && !noData && (
+        {parentStateSummary !== 'loggedOut' && (
           <div className="flex justify-between">
-            <ComboBox
-              selectedId={selectedId}
-              setSelectedId={setSelectedId}
-              projectKeysInfo={projectKeys}
-              variable={variable}
-              isLoading={isLoading}
-            />
-            <CopyToClipboard text={currentSelection}>
+            <ComboBox parentStateSummary={parentStateSummary} />
+            <CopyToClipboard text={variableValue ?? ''}>
               <Button
+                disabled={!variableValue}
                 variant="ghost"
                 className="w-[var(--copy-button-size)]"
                 onClick={handleCopy}
@@ -348,14 +417,16 @@ export function ProjectConfigVariables({ variable }: { variable: Variable }) {
         type="text"
         className="font-mono"
         value={
-          isLoading
+          apiStateSummary === 'userLoading' ||
+          apiStateSummary === 'loggedIn.dataPending' ||
+          apiStateSummary === 'loggedIn.hasData.apiDataPending'
             ? 'Loading...'
-            : !isLoggedIn || noData
-            ? `YOUR ${prettyFormatVariable[variable].toUpperCase()}`
-            : currentSelection
+            : apiStateSummary === 'loggedIn.hasData.hasApiData'
+            ? variableValue
+            : `YOUR ${prettyFormatVariable[variable].toUpperCase()}`
         }
       />
-      {!isLoggedIn && (
+      {parentStateSummary === 'loggedOut' && (
         <p className="text-foreground-muted text-sm mt-2 mb-0 ml-1">
           There was a problem getting your {prettyFormatVariable[variable]}. Are you{' '}
           <Link
@@ -369,34 +440,148 @@ export function ProjectConfigVariables({ variable }: { variable: Variable }) {
           ?
         </p>
       )}
-      {isLoggedIn && noData && (
-        <>
-          <p className="text-foreground-muted text-sm mt-2 mb-0 ml-1">
-            There was a problem getting your {prettyFormatVariable[variable]}. Do you have{' '}
-            <Link
-              className="text-foreground-muted"
-              href="/dashboard"
-              rel="noreferrer noopener"
-              target="_blank"
-            >
-              any projects
-            </Link>
-            ?
-          </p>
-          <p className="text-foreground-muted text-sm mt-0 ml-1">
-            You can also try looking up the value in the{' '}
-            <Link
-              className="text-foreground-muted"
-              href="/dashboard/project/_/settings/api"
-              rel="noreferrer noopener"
-              target="_blank"
-            >
-              dashboard
-            </Link>
-            .
-          </p>
-        </>
-      )}
+      {apiStateSummary === 'loggedIn.hasNoData' ||
+        ('loggedIn.hasNoApiData' /* */ && (
+          <>
+            <p className="text-foreground-muted text-sm mt-2 mb-0 ml-1">
+              There was a problem getting your {prettyFormatVariable[variable]}. Do you have{' '}
+              <Link
+                className="text-foreground-muted"
+                href="/dashboard"
+                rel="noreferrer noopener"
+                target="_blank"
+              >
+                any projects
+              </Link>
+              ?
+            </p>
+            <p className="text-foreground-muted text-sm mt-0 ml-1">
+              You can also try looking up the value in the{' '}
+              <Link
+                className="text-foreground-muted"
+                href="/dashboard/project/_/settings/api"
+                rel="noreferrer noopener"
+                target="_blank"
+              >
+                dashboard
+              </Link>
+              .
+            </p>
+          </>
+        ))}
     </div>
   )
+}
+
+export function ProjectConfigVariables({ variable }: { variable: Variable }) {
+  const isUserLoading = useIsUserLoading()
+  const isLoggedIn = useIsLoggedIn()
+
+  const {
+    selectedInstance,
+    setSelectedInstance,
+    clear: clearSharedStoreData,
+  } = useSnapshot(projectStore)
+  const queryClient = useQueryClient()
+  const {
+    data: organizations,
+    isPending: organizationsIsPending,
+    isError: organizationsIsError,
+  } = useOrganizationsQuery()
+  const {
+    data: projects,
+    isPending: projectsIsPending,
+    isError: projectsIsError,
+  } = useProjectsQuery()
+  const {
+    data: branches,
+    isPending: branchesIsPending,
+    isError: branchesIsError,
+    invalidate: invalidateAllProjectsBranchesQuery,
+  } = useAllProjectsBranchesQuery()
+
+  const anyIsPending = organizationsIsPending || projectsIsPending || branchesIsPending
+  const anyIsError = organizationsIsError || projectsIsError || branchesIsError
+
+  const stateSummary: ProjectConfigVariablesState = isUserLoading
+    ? 'userLoading'
+    : !isLoggedIn
+    ? 'loggedOut'
+    : anyIsPending
+    ? 'loggedIn.dataPending'
+    : anyIsError
+    ? 'loggedIn.dataError'
+    : projects.length === 0
+    ? 'loggedIn.hasNoData'
+    : 'loggedIn.hasData'
+
+  const cleanUp = useCallback(() => {
+    // This is a safeguard against display bugs,
+    // since the page will keep displaying after the user logs out.
+    // This way no data is left to display even if there is a view bug.
+    if (stateSummary === 'loggedOut') {
+      invalidateProjectsQuery(queryClient)
+      invalidateOrganizationsQuery(queryClient)
+      invalidateAllProjectsBranchesQuery()
+      // @ts-ignore -- problem with OpenAPI spec that codegen reads from
+      invalidateProjectApiQuery({ projectRef: selectedInstance?.project.ref }, queryClient)
+      clearSharedStoreData()
+    }
+  }, [
+    selectedInstance,
+    stateSummary,
+    clearSharedStoreData,
+    invalidateAllProjectsBranchesQuery,
+    queryClient,
+  ])
+  useOnLogout(cleanUp)
+
+  const formattedData: InstanceData[] = useMemo(
+    () =>
+      projects.flatMap((project) => {
+        const organization =
+          organizations.find((organization) => organization.id === project.organization_id) ?? null
+
+        // @ts-ignore -- problem with OpenAPI spec that codegen reads from
+        if (!project.is_branch_enabled) {
+          return { organization, project }
+        }
+
+        // @ts-ignore -- problem with OpenAPI spec that codegen reads from
+        const projectBranches = branches[project.ref]
+        if (!projectBranches) {
+          return { organization, project }
+        }
+
+        return projectBranches.map((branch) => ({ organization, project, branch }))
+      }),
+    [branches, organizations, projects]
+  )
+
+  useEffect(() => {
+    if (!selectedInstance && typeof window !== undefined) {
+      let storedInstance: InstanceData = null
+      const dehydratedInstance = retrieve('local', LOCAL_STORAGE_KEYS.SAVED_ORG_PROJECT_BRANCH)
+      if (dehydratedInstance) {
+        try {
+          const [organizationId, projectRef, branchId] = JSON.parse(dehydratedInstance)
+          if (organizationId !== null) {
+            storedInstance =
+              formattedData.find(
+                (instance) =>
+                  instance.organization?.id === organizationId &&
+                  // @ts-ignore -- problem with OpenAPI spec that codegen reads from
+                  instance.project.ref === projectRef &&
+                  (branchId === null || instance.branch?.id === branchId)
+              ) ?? null
+          }
+        } catch {
+          // Fails gracefully, no need to handle error
+        }
+      }
+      setSelectedInstance(storedInstance ?? formattedData[0] ?? null)
+    }
+  }, [selectedInstance, setSelectedInstance, formattedData])
+
+  return <ProjectConfigVariablesView variable={variable} parentStateSummary={stateSummary} />
 }
